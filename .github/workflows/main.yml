@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   # 定期実行 (UTC 11:00 = JST 20:00)
   schedule:
-    - cron: '45 05 * * *'
+    - cron: '55 05 * * *'
 
 jobs:
   run-script:
