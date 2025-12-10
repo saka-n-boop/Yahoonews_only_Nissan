@@ -26,6 +26,10 @@ from google.genai import types
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, InternalServerError
 # ------------------------------------
 
+# --- コメント収集用モジュールのインポート ---
+import comment_scraper
+# ------------------------------------
+
 # ====== 設定 ======
 SHARED_SPREADSHEET_ID = os.environ.get("SPREADSHEET_KEY")
 if not SHARED_SPREADSHEET_ID:
@@ -40,12 +44,11 @@ MAX_SHEET_ROWS_FOR_REPLACE = 10000
 # 最大取得ページ数を10に設定
 MAX_PAGES = 10 
 
-# ヘッダー (J列, K列, L列を含む全12列)
-# 【変更】L列に「ニュースチェック日時」を追加
+# ヘッダー (G列にチェック日時、H列以降にGemini分析結果)
 YAHOO_SHEET_HEADERS = [
     "URL", "タイトル", "投稿日時", "ソース", "本文", "コメント数", 
-    "対象企業", "カテゴリ分類", "ポジネガ分類", "日産関連文", "日産ネガ文", 
-    "ニュースチェック日時"
+    "ニュースチェック日時", # G列
+    "対象企業", "カテゴリ分類", "ポジネガ分類", "日産関連文", "日産ネガ文" # H～L列
 ]
 REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
 TZ_JST = timezone(timedelta(hours=9))
@@ -78,9 +81,9 @@ if not AVAILABLE_API_KEYS:
 
 CURRENT_KEY_INDEX = 0
 REQUEST_COUNT_PER_KEY = 0
-MAX_REQUESTS_BEFORE_ROTATE = 20  # 20回リクエストしたらキーを切り替え
-BATCH_SIZE = 5                   # 5行まとめて処理
-NORMAL_WAIT_SECONDS = 15         # RPM対策：リクエスト毎の待機時間（秒）
+MAX_REQUESTS_BEFORE_ROTATE = 20
+BATCH_SIZE = 5
+NORMAL_WAIT_SECONDS = 15
 
 GEMINI_PROMPT_TEMPLATE = None
 
@@ -128,7 +131,6 @@ def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
                 dt = datetime.strptime(s, fmt)
                 if fmt == "%m/%d %H:%M":
                     dt = dt.replace(year=today_jst.year)
-                # 未来日付なら去年に補正
                 if dt.replace(tzinfo=TZ_JST) > today_jst + timedelta(days=31):
                     dt = dt.replace(year=dt.year - 1)
                 return dt.replace(tzinfo=TZ_JST)
@@ -136,24 +138,16 @@ def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
                 pass
         return None
 
-# 【新機能】ニュースチェック日時の計算ロジック
 def calculate_check_date_str(dt_obj: datetime) -> str:
     """
     15:00:01 ～ 翌15:00:00 のサイクルで日付を判定
-    dt_obj > 当日15:00:00 なら翌日扱い
-    dt_obj <= 当日15:00:00 なら当日扱い
     """
     if not dt_obj:
         return ""
-    
-    # 判定基準：その日の15:00:00ちょうど
     threshold = dt_obj.replace(hour=15, minute=0, second=0, microsecond=0)
-    
     if dt_obj > threshold:
-        # 15:00:01以降なので翌日
         return (dt_obj + timedelta(days=1)).strftime("%Y/%m/%d")
     else:
-        # 15:00:00以前なので当日
         return dt_obj.strftime("%Y/%m/%d")
 
 def build_gspread_client() -> gspread.Client:
@@ -271,7 +265,6 @@ def call_gemini_api(prompt: str, is_batch: bool = False) -> Any:
         if not client: return None
         try:
             rotate_api_key_if_needed()
-            # 【修正】モデル名を gemini-2.0-flash に修正 (2.5は存在しないため)
             response = client.models.generate_content(
                 model='gemini-2.5-flash', 
                 contents=final_prompt,
@@ -383,12 +376,11 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
             
             if title and url:
                 formatted_date = date_str
-                check_date_str = "" # ニュースチェック日時用
+                check_date_str = ""
                 try:
                     dt_obj = parse_post_date(date_str, today_jst)
                     if dt_obj:
                         formatted_date = format_datetime(dt_obj)
-                        # 【追加】チェック日時計算
                         check_date_str = calculate_check_date_str(dt_obj)
                     else:
                         formatted_date = re.sub(r"\([月火水木金土日]\)", "", date_str).replace('配信', '').strip()
@@ -465,18 +457,18 @@ def write_news_list_to_source(gc: gspread.Client, articles: list[dict]):
     sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
     ws = ensure_source_sheet_headers(sh)
     existing_urls = set(str(row[0]) for row in ws.get_all_values(value_render_option='UNFORMATTED_VALUE')[1:] if len(row) > 0 and str(row[0]).startswith("http"))
-    # 【変更】ニュースチェック日時(L列)も含めて書き込み
-    new_data = [[a['URL'], a['タイトル'], a['投稿日時'], a['ソース'], a.get('ニュースチェック日時', '')] for a in articles if a['URL'] not in existing_urls]
+    # 【変更】E, F列は空にして、G列にチェック日時を入れる
+    new_data = [
+        [
+            a['URL'], a['タイトル'], a['投稿日時'], a['ソース'], 
+            "", "",  # E列:本文, F列:コメント数 は空欄
+            a.get('ニュースチェック日時', '') # G列
+        ] 
+        for a in articles if a['URL'] not in existing_urls
+    ]
     
     if new_data:
-        # L列は離れているため、一旦A～D列を書き込み、L列はあとで埋める方針だと行ズレのリスクがある。
-        # append_rowsは連続した列に入れるのが基本だが、今回は「本文」などがまだ空の状態。
-        # なので、URL(A), タイトル(B), 日時(C), ソース(D) ... (飛んで) ... チェック日時(L) としたいが
-        # append_rowsでそれをやるのは難しい。
-        # 解決策：A,B,C,Dを入れて、L列は Step3 の「一括計算＆ソート」で埋めるのが一番安全。
-        # 念のため、A～D列だけ書き込む。
-        formatted_data = [[row[0], row[1], row[2], row[3]] for row in new_data]
-        ws.append_rows(formatted_data, value_input_option='USER_ENTERED')
+        ws.append_rows(new_data, value_input_option='USER_ENTERED')
         print(f"  SOURCEシートに {len(new_data)} 件追記しました。")
 
 def fetch_details_and_update_sheet(gc: gspread.Client):
@@ -522,6 +514,7 @@ def fetch_details_and_update_sheet(gc: gspread.Client):
         has_change = (final_body != current_body) or (final_cmt != comment_count_str) or (final_date != post_date_raw)
         
         if has_change:
+            # C, D, E, F列を更新 (Dはソース。ここでは書き換えないが範囲に含むため現在の値を入れる)
             new_row = [final_date, str(data_row[3]), final_body, final_cmt]
             update_sheet_with_retry(ws, range_name=f'C{row_num}:F{row_num}', values=[new_row])
             update_count += 1
@@ -535,12 +528,10 @@ def sort_yahoo_sheet(gc: gspread.Client):
     except: return
     if len(ws.col_values(1)) <= 1: return
 
-    # 【追加】ステップ3の直前に「ニュースチェック日時(L列)」を一括計算・更新
-    # これにより、新規行も既存行も、また日付修正があった行も全て正しい値になる
-    print(" ? ニュースチェック日時(L列)の一括更新中...")
+    # 【変更】ニュースチェック日時(G列)を一括更新
+    print(" ? ニュースチェック日時(G列)の一括更新中...")
     try:
-        # C列(日付)を全て取得
-        date_column = ws.col_values(3)[1:] # ヘッダー除く
+        date_column = ws.col_values(3)[1:] # C列(日付)
         check_date_updates = []
         now_jst = jst_now()
         
@@ -550,16 +541,15 @@ def sort_yahoo_sheet(gc: gspread.Client):
                 check_val = calculate_check_date_str(parsed)
                 check_date_updates.append([check_val])
             else:
-                check_date_updates.append([""]) # 日付不明なら空
+                check_date_updates.append([""]) 
         
-        # L2から一気に書き込み
+        # G2から書き込み
         if check_date_updates:
-            update_sheet_with_retry(ws, f'L2:L{len(check_date_updates)+1}', check_date_updates)
+            update_sheet_with_retry(ws, f'G2:G{len(check_date_updates)+1}', check_date_updates)
             
     except Exception as e:
         print(f" ?? ニュースチェック日時更新エラー: {e}")
 
-    # クリーニングとソート
     try:
         requests = []
         days_of_week = ["月", "火", "水", "木", "金", "土", "日"]
@@ -573,10 +563,11 @@ def sort_yahoo_sheet(gc: gspread.Client):
             "fields": "userEnteredFormat.numberFormat"
         }})
         
+        # 【修正】前回エラーだった箇所: ws.batch_update -> ws.spreadsheet.batch_update
         ws.spreadsheet.batch_update({"requests": requests})
         time.sleep(1)
         
-        # ソート範囲をL列まで拡張
+        # G列まで含むが、ソートキーはC列(3列目)のまま
         ws.sort((3, 'des'), range=f'A2:{gspread_util_col_to_letter(len(YAHOO_SHEET_HEADERS))}{ws.row_count}')
         set_row_height(ws, 21)
         print(" ? シートのソート・整形完了")
@@ -601,12 +592,13 @@ def analyze_with_gemini_and_update_sheet(gc: gspread.Client):
         if len(data_row) < len(YAHOO_SHEET_HEADERS): data_row.extend([''] * (len(YAHOO_SHEET_HEADERS) - len(data_row)))
         row_num = idx + 2
         body = str(data_row[4])
-        # 【修正】L列が増えたのでインデックスもずれるが、G～K列(6,7,8,9,10)は変わらず。
-        current_vals = data_row[6:11]
+        # 【変更】チェック済み判定カラムは H(7)～L(11) になる (全5項目)
+        current_vals = data_row[7:12]
         
         if all(str(v).strip() for v in current_vals): continue
         if not body.strip() or body == "本文取得不可":
-            update_sheet_with_retry(ws, f'G{row_num}:K{row_num}', [['N/A(No Body)', 'N/A', 'N/A', 'N/A', 'N/A']])
+            # H～L列をN/Aで埋める
+            update_sheet_with_retry(ws, f'H{row_num}:L{row_num}', [['N/A(No Body)', 'N/A', 'N/A', 'N/A', 'N/A']])
             continue
             
         pending_rows.append({"id": row_num, "body": body, "title": str(data_row[1])})
@@ -623,13 +615,14 @@ def analyze_with_gemini_and_update_sheet(gc: gspread.Client):
                     vals = [res.get("company_info", "N/A"), res.get("category", "N/A"), res.get("sentiment", "N/A"), res.get("nissan_related", "なし"), res.get("nissan_negative", "なし")]
                     for j in [3, 4]:
                         if any(x in vals[j].lower() for x in ["not mentioned", "no mention", "言及はありません", "none"]): vals[j] = "なし"
-                    update_sheet_with_retry(ws, f'G{item["id"]}:K{item["id"]}', [vals])
+                    # 【変更】書き込み先は H～L列
+                    update_sheet_with_retry(ws, f'H{item["id"]}:L{item["id"]}', [vals])
                     total_processed += 1
                 else:
                     print(f"      - 行 {item['id']} の結果がバッチに含まれていません。単体リトライします。")
                     single_res = analyze_single(item['body'])
                     vals = [single_res["company_info"], single_res["category"], single_res["sentiment"], single_res["nissan_related"], single_res["nissan_negative"]]
-                    update_sheet_with_retry(ws, f'G{item["id"]}:K{item["id"]}', [vals])
+                    update_sheet_with_retry(ws, f'H{item["id"]}:L{item["id"]}', [vals])
         else:
             print("    ! バッチ処理失敗。個別処理モード(Fallback)でリトライします。")
             for item in batch:
@@ -638,7 +631,7 @@ def analyze_with_gemini_and_update_sheet(gc: gspread.Client):
                 vals = [res["company_info"], res["category"], res["sentiment"], res["nissan_related"], res["nissan_negative"]]
                 for j in [3, 4]:
                     if any(x in vals[j].lower() for x in ["not mentioned", "no mention", "言及はありません", "none"]): vals[j] = "なし"
-                update_sheet_with_retry(ws, f'G{item["id"]}:K{item["id"]}', [vals])
+                update_sheet_with_retry(ws, f'H{item["id"]}:L{item["id"]}', [vals])
                 total_processed += 1
                 time.sleep(NORMAL_WAIT_SECONDS)
 
@@ -655,10 +648,15 @@ def main():
         articles = get_yahoo_news_with_selenium(kw)
         write_news_list_to_source(gc, articles)
         time.sleep(2)
-        
+
+    print("\n=====  本文・コメント取得  =====")
     fetch_details_and_update_sheet(gc)
+    print("\n=====   記事データのソートと整形 =====")
     sort_yahoo_sheet(gc)
+    print("\n=====   Gemini分析 =====")
     analyze_with_gemini_and_update_sheet(gc)
+    print("\n===== ⑤ コメント取得開始 =====")
+    comment_scraper.run_comment_collection(gc, SHARED_SPREADSHEET_ID, SOURCE_SHEET_NAME)
     print("\n--- 統合スクリプト完了 ---")
 
 if __name__ == '__main__':
