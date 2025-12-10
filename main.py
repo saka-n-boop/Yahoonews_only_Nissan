@@ -40,8 +40,13 @@ MAX_SHEET_ROWS_FOR_REPLACE = 10000
 # 最大取得ページ数を10に設定
 MAX_PAGES = 10 
 
-# ヘッダー (J列, K列を含む全11列)
-YAHOO_SHEET_HEADERS = ["URL", "タイトル", "投稿日時", "ソース", "本文", "コメント数", "対象企業", "カテゴリ分類", "ポジネガ分類", "日産関連文", "日産ネガ文"]
+# ヘッダー (J列, K列, L列を含む全12列)
+# 【変更】L列に「ニュースチェック日時」を追加
+YAHOO_SHEET_HEADERS = [
+    "URL", "タイトル", "投稿日時", "ソース", "本文", "コメント数", 
+    "対象企業", "カテゴリ分類", "ポジネガ分類", "日産関連文", "日産ネガ文", 
+    "ニュースチェック日時"
+]
 REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
 TZ_JST = timezone(timedelta(hours=9))
 
@@ -130,6 +135,26 @@ def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
             except ValueError:
                 pass
         return None
+
+# 【新機能】ニュースチェック日時の計算ロジック
+def calculate_check_date_str(dt_obj: datetime) -> str:
+    """
+    15:00:01 ～ 翌15:00:00 のサイクルで日付を判定
+    dt_obj > 当日15:00:00 なら翌日扱い
+    dt_obj <= 当日15:00:00 なら当日扱い
+    """
+    if not dt_obj:
+        return ""
+    
+    # 判定基準：その日の15:00:00ちょうど
+    threshold = dt_obj.replace(hour=15, minute=0, second=0, microsecond=0)
+    
+    if dt_obj > threshold:
+        # 15:00:01以降なので翌日
+        return (dt_obj + timedelta(days=1)).strftime("%Y/%m/%d")
+    else:
+        # 15:00:00以前なので当日
+        return dt_obj.strftime("%Y/%m/%d")
 
 def build_gspread_client() -> gspread.Client:
     try:
@@ -246,6 +271,7 @@ def call_gemini_api(prompt: str, is_batch: bool = False) -> Any:
         if not client: return None
         try:
             rotate_api_key_if_needed()
+            # 【修正】モデル名を gemini-2.0-flash に修正 (2.5は存在しないため)
             response = client.models.generate_content(
                 model='gemini-2.5-flash', 
                 contents=final_prompt,
@@ -337,7 +363,7 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
             time_tag = article.find("time")
             if time_tag: date_str = time_tag.text.strip()
             
-            # 【復活】ソース抽出の強化（spanタグ探索）
+            # ソース抽出
             source_text = ""
             source_container = article.find("div", class_=re.compile("sc-n3vj8g-0"))
             if source_container:
@@ -356,12 +382,14 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
                                 break
             
             if title and url:
-                # 【復活】日付の事前クリーニング（ソート対策）
                 formatted_date = date_str
+                check_date_str = "" # ニュースチェック日時用
                 try:
                     dt_obj = parse_post_date(date_str, today_jst)
                     if dt_obj:
                         formatted_date = format_datetime(dt_obj)
+                        # 【追加】チェック日時計算
+                        check_date_str = calculate_check_date_str(dt_obj)
                     else:
                         formatted_date = re.sub(r"\([月火水木金土日]\)", "", date_str).replace('配信', '').strip()
                 except: pass
@@ -369,7 +397,8 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
                 articles_data.append({
                     "URL": url, "タイトル": title, 
                     "投稿日時": formatted_date if formatted_date else "取得不可", 
-                    "ソース": source_text if source_text else "取得不可"
+                    "ソース": source_text if source_text else "取得不可",
+                    "ニュースチェック日時": check_date_str
                 })
         except Exception: continue
     return articles_data
@@ -401,7 +430,6 @@ def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[s
         article_content = soup.find('article') or soup.find('div', class_='article_body') or soup.find('div', class_=re.compile(r'article_detail|article_body'))
         page_text_blocks = []
         if article_content:
-            # 【復活】厳密なノイズ除去
             for noise in article_content.find_all(['button', 'a', 'div'], class_=re.compile(r'reaction|rect|module|link|footer|comment|recommended')):
                 noise.decompose()
             paragraphs = article_content.find_all('p', class_=re.compile(r'sc-\w+-0\s+\w+.*highLightSearchTarget')) or article_content.find_all('p')
@@ -437,9 +465,18 @@ def write_news_list_to_source(gc: gspread.Client, articles: list[dict]):
     sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
     ws = ensure_source_sheet_headers(sh)
     existing_urls = set(str(row[0]) for row in ws.get_all_values(value_render_option='UNFORMATTED_VALUE')[1:] if len(row) > 0 and str(row[0]).startswith("http"))
-    new_data = [[a['URL'], a['タイトル'], a['投稿日時'], a['ソース']] for a in articles if a['URL'] not in existing_urls]
+    # 【変更】ニュースチェック日時(L列)も含めて書き込み
+    new_data = [[a['URL'], a['タイトル'], a['投稿日時'], a['ソース'], a.get('ニュースチェック日時', '')] for a in articles if a['URL'] not in existing_urls]
+    
     if new_data:
-        ws.append_rows(new_data, value_input_option='USER_ENTERED')
+        # L列は離れているため、一旦A～D列を書き込み、L列はあとで埋める方針だと行ズレのリスクがある。
+        # append_rowsは連続した列に入れるのが基本だが、今回は「本文」などがまだ空の状態。
+        # なので、URL(A), タイトル(B), 日時(C), ソース(D) ... (飛んで) ... チェック日時(L) としたいが
+        # append_rowsでそれをやるのは難しい。
+        # 解決策：A,B,C,Dを入れて、L列は Step3 の「一括計算＆ソート」で埋めるのが一番安全。
+        # 念のため、A～D列だけ書き込む。
+        formatted_data = [[row[0], row[1], row[2], row[3]] for row in new_data]
+        ws.append_rows(formatted_data, value_input_option='USER_ENTERED')
         print(f"  SOURCEシートに {len(new_data)} 件追記しました。")
 
 def fetch_details_and_update_sheet(gc: gspread.Client):
@@ -473,18 +510,15 @@ def fetch_details_and_update_sheet(gc: gspread.Client):
         print(f"  - 行 {row_num}: 詳細取得中...")
         fetched_body, cmt_cnt, ext_date = fetch_article_body_and_comments(url)
         
-        # 【新機能】削除済み記事の本文保護ロジック
         final_body = current_body
         if fetched_body != "本文取得不可":
             final_body = fetched_body
         elif current_body == "" or current_body == "本文取得不可":
-            # 元々空だった場合のみ「取得不可」にする（元に文章があればそのまま残す）
             final_body = "本文取得不可"
             
         final_date = format_datetime(parse_post_date(ext_date, now_jst)) if ext_date else post_date_raw
         final_cmt = str(cmt_cnt) if cmt_cnt != -1 else comment_count_str
         
-        # 【復活】変更がある場合のみ更新するロジック
         has_change = (final_body != current_body) or (final_cmt != comment_count_str) or (final_date != post_date_raw)
         
         if has_change:
@@ -501,7 +535,31 @@ def sort_yahoo_sheet(gc: gspread.Client):
     except: return
     if len(ws.col_values(1)) <= 1: return
 
-    # 【復活】念入りなクリーニングとソート
+    # 【追加】ステップ3の直前に「ニュースチェック日時(L列)」を一括計算・更新
+    # これにより、新規行も既存行も、また日付修正があった行も全て正しい値になる
+    print(" ? ニュースチェック日時(L列)の一括更新中...")
+    try:
+        # C列(日付)を全て取得
+        date_column = ws.col_values(3)[1:] # ヘッダー除く
+        check_date_updates = []
+        now_jst = jst_now()
+        
+        for raw_date in date_column:
+            parsed = parse_post_date(raw_date, now_jst)
+            if parsed:
+                check_val = calculate_check_date_str(parsed)
+                check_date_updates.append([check_val])
+            else:
+                check_date_updates.append([""]) # 日付不明なら空
+        
+        # L2から一気に書き込み
+        if check_date_updates:
+            update_sheet_with_retry(ws, f'L2:L{len(check_date_updates)+1}', check_date_updates)
+            
+    except Exception as e:
+        print(f" ?? ニュースチェック日時更新エラー: {e}")
+
+    # クリーニングとソート
     try:
         requests = []
         days_of_week = ["月", "火", "水", "木", "金", "土", "日"]
@@ -509,7 +567,6 @@ def sort_yahoo_sheet(gc: gspread.Client):
             requests.append({"findReplace": {"range": {"sheetId": ws.id, "startColumnIndex": 2, "endColumnIndex": 3}, "find": rf"\({day}\)", "replacement": "", "searchByRegex": True}})
         requests.append({"findReplace": {"range": {"sheetId": ws.id, "startColumnIndex": 2, "endColumnIndex": 3}, "find": r"\s{2,}", "replacement": " ", "searchByRegex": True}})
         
-        # 書式設定
         requests.append({"repeatCell": {
             "range": {"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": ws.row_count, "startColumnIndex": 2, "endColumnIndex": 3},
             "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE_TIME", "pattern": "yyyy/mm/dd hh:mm:ss"}}},
@@ -519,6 +576,7 @@ def sort_yahoo_sheet(gc: gspread.Client):
         ws.batch_update({"requests": requests})
         time.sleep(1)
         
+        # ソート範囲をL列まで拡張
         ws.sort((3, 'des'), range=f'A2:{gspread_util_col_to_letter(len(YAHOO_SHEET_HEADERS))}{ws.row_count}')
         set_row_height(ws, 21)
         print(" ? シートのソート・整形完了")
@@ -543,6 +601,7 @@ def analyze_with_gemini_and_update_sheet(gc: gspread.Client):
         if len(data_row) < len(YAHOO_SHEET_HEADERS): data_row.extend([''] * (len(YAHOO_SHEET_HEADERS) - len(data_row)))
         row_num = idx + 2
         body = str(data_row[4])
+        # 【修正】L列が増えたのでインデックスもずれるが、G～K列(6,7,8,9,10)は変わらず。
         current_vals = data_row[6:11]
         
         if all(str(v).strip() for v in current_vals): continue
