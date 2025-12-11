@@ -144,7 +144,7 @@ def calculate_check_date_str(dt_obj: datetime) -> str:
     """
     if not dt_obj:
         return ""
-    threshold = dt_obj.replace(hour=15, minute=0, second=0, microsecond=0)
+    threshold = dt_obj.replace(hour=14, minute=30, second=0, microsecond=0)
     if dt_obj > threshold:
         return (dt_obj + timedelta(days=1)).strftime("%Y/%m/%d")
     else:
