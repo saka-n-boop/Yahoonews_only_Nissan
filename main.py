@@ -644,17 +644,17 @@ def main():
     try: gc = build_gspread_client()
     except Exception as e: sys.exit(1)
 
-#    for kw in keywords:
-#        articles = get_yahoo_news_with_selenium(kw)
-#        write_news_list_to_source(gc, articles)
-#        time.sleep(2)
+    for kw in keywords:
+        articles = get_yahoo_news_with_selenium(kw)
+        write_news_list_to_source(gc, articles)
+        time.sleep(2)
 
-#    print("\n=====  本文・コメント取得  =====")
-#    fetch_details_and_update_sheet(gc)
-#    print("\n=====   記事データのソートと整形 =====")
-#    sort_yahoo_sheet(gc)
-#    print("\n=====   Gemini分析 =====")
-#    analyze_with_gemini_and_update_sheet(gc)
+    print("\n=====  本文・コメント取得  =====")
+    fetch_details_and_update_sheet(gc)
+    print("\n=====   記事データのソートと整形 =====")
+    sort_yahoo_sheet(gc)
+    print("\n=====   Gemini分析 =====")
+    analyze_with_gemini_and_update_sheet(gc)
     print("\n===== ⑤ コメント取得開始 =====")
     comment_scraper.run_comment_collection(gc, SHARED_SPREADSHEET_ID, SOURCE_SHEET_NAME)
     print("\n--- 統合スクリプト完了 ---")
