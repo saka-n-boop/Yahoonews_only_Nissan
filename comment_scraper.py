@@ -166,9 +166,8 @@ def run_comment_collection(gc: gspread.Client, source_sheet_id: str, source_shee
         post_date = row[2]
         source = row[3]
         comment_count_str = row[5]
-        target_company = row[6] # G列
-        # sentiment = row[8]
-        nissan_neg_text = row[10] # K列
+        target_company = row[7] # H列
+        nissan_neg_text = row[11] # L列
         
         # 重複チェック
         if url in existing_urls:
@@ -217,3 +216,4 @@ def run_comment_collection(gc: gspread.Client, source_sheet_id: str, source_shee
         set_row_height(dest_ws, 21)
 
     print(f" ? コメント収集完了: 新たに {process_count} 件の記事からコメントを保存しました。")
+
