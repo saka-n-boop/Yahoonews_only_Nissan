@@ -243,14 +243,43 @@ def call_gemini_api(prompt: str, is_batch: bool = False, schema: dict = None) ->
     
     for attempt in range(MAX_RETRIES):
         try:
+                for attempt in range(MAX_RETRIES):
+        try:
             response = client.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    response_schema=schema
+                    response_schema=schema,
+                    # 【追加】セーフティフィルタを無効化する設定
+                    safety_settings=[
+                        types.SafetySetting(
+                            category="HARM_CATEGORY_HATE_SPEECH",
+                            threshold="BLOCK_NONE"
+                        ),
+                        types.SafetySetting(
+                            category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                            threshold="BLOCK_NONE"
+                        ),
+                        types.SafetySetting(
+                            category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                            threshold="BLOCK_NONE"
+                        ),
+                        types.SafetySetting(
+                            category="HARM_CATEGORY_HARASSMENT",
+                            threshold="BLOCK_NONE"
+                        )
+                    ]
                 ),
             )
+            return json.loads(response.text.strip())
+
+        except ResourceExhausted:
+            print("    !! 429 Error (Quota Exceeded). Rotating key...")
+            rotate_api_key(reason="429_error")
+            client = get_current_gemini_client()
+            continue
+
             return json.loads(response.text.strip())
 
         except ResourceExhausted:
